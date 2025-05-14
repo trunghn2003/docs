@@ -263,3 +263,170 @@ Kiến trúc này cho phép:
 - Cải thiện bảo mật bằng cách ẩn các internal services
 
 Với việc sử dụng các biến môi trường, bạn cũng có thể dễ dàng cấu hình hệ thống cho các môi trường khác nhau mà không cần thay đổi code.
+# Giải thích về cấu hình Spring Cloud Gateway
+
+Đoạn code này là cấu hình cho Spring Cloud Gateway, một thành phần quan trọng trong kiến trúc microservices của bạn, có nhiệm vụ định tuyến các yêu cầu API từ client đến các dịch vụ nội bộ tương ứng. Hãy phân tích chi tiết:
+
+## Tổng quan về lớp `SpringCloudConfig`
+
+Đây là một lớp cấu hình (`@Configuration`) xác định cách API Gateway định tuyến các request HTTP đến các microservices khác nhau trong hệ thống:
+
+```java
+@Configuration
+public class SpringCloudConfig {
+    // ...
+}
+```
+
+## Cấu hình Authentication Filter
+
+```java
+@Autowired
+private AuthenticationFilter authFilter;
+
+private AuthenticationFilter.Config configWithAuth(boolean roleValidationRequired,
+        java.util.List<String> requiredRoles) {
+    AuthenticationFilter.Config config = new AuthenticationFilter.Config();
+    config.setRoleValidationRequired(roleValidationRequired);
+    config.setRequiredRoles(requiredRoles);
+    return config;
+}
+```
+
+Phương thức `configWithAuth` tạo cấu hình cho bộ lọc xác thực với:
+- `roleValidationRequired`: Xác định liệu endpoint có yêu cầu kiểm tra role hay không
+- `requiredRoles`: Danh sách các role được phép truy cập endpoint
+
+## Cấu hình định tuyến (Route Configuration)
+
+Bean `customRouteLocator` định nghĩa tất cả các tuyến đường cho API Gateway:
+
+### 1. Các endpoint công khai của Auth Service (không yêu cầu xác thực)
+
+```java
+.route("auth-service-public-login",
+        r -> r.path("/api/auth/login").or().path("/api/auth/signin")
+                .filters(f -> f
+                        .rewritePath("/api/auth/(?<path>.*)", "/api/auth/${path}")
+                        .filter((exchange, chain) -> {
+                            // Logging filter
+                        }))
+                .uri("lb://auth-service"))
+```
+
+- **ID**: `auth-service-public-login`
+- **Path**: Khớp với `/api/auth/login` hoặc `/api/auth/signin`
+- **Filters**:
+  - `rewritePath`: Chuyển đổi đường dẫn trước khi gửi đến service (giữ nguyên trong trường hợp này)
+  - Filter logging để ghi lại thông tin request/response
+- **URI**: `lb://auth-service` - sử dụng load balancer để gửi đến service "auth-service" đã đăng ký với Eureka
+
+Tương tự cho các endpoint public khác: `register`, `signup`, và `validate-token`.
+
+### 2. Các endpoint bảo vệ của Auth Service (yêu cầu xác thực)
+
+```java
+.route("auth-service-protected",
+        r -> r.path("/api/auth/**")
+                .and()
+                .not(r1 -> r1.path("/api/auth/login", "/api/auth/register", "/api/auth/validate-token"))
+                .filters(f -> f
+                        .rewritePath("/api/auth/(?<path>.*)", "/api/auth/${path}")
+                        .filter(authFilter.apply(configWithAuth(false, null)))
+                        // Logging filter
+                )
+                .uri("lb://auth-service"))
+```
+
+- **Path**: Bất kỳ đường dẫn nào khớp với `/api/auth/**` nhưng không phải `/api/auth/login`, `/api/auth/register`, hoặc `/api/auth/validate-token`
+- **Filters**: 
+  - Áp dụng AuthenticationFilter (yêu cầu user đã xác thực nhưng không kiểm tra role)
+  - Giá trị `false` cho `roleValidationRequired` và `null` cho `requiredRoles` nghĩa là chỉ cần user đã đăng nhập
+
+### 3. Các endpoint User Service (yêu cầu role USER hoặc ADMIN hoặc STAFF)
+
+```java
+.route("user-service-standard", 
+       r -> r.path("/api/users/**")
+               .filters(f -> f
+                       .rewritePath("/api/users/(?<path>.*)", "/api/users/${path}")
+                       .filter(authFilter.apply(
+                               configWithAuth(true, Arrays.asList("ROLE_USER", "ROLE_ADMIN", "ROLE_STAFF"))))
+                       // Logging filter
+               )
+               .uri("lb://user-service"))
+```
+
+- **Path**: Khớp với `/api/users/**`
+- **Filters**:
+  - Yêu cầu xác thực với kiểm tra role (`roleValidationRequired = true`)
+  - Chỉ những user có role "ROLE_USER", "ROLE_ADMIN", hoặc "ROLE_STAFF" mới được phép truy cập
+
+### 4. Các endpoint Movie Show Service
+
+```java
+.route("movie-show-service", 
+       r -> r.path("/api/movieshows/**", "/api/shows/**", "/api/tickets/**", "/api/snacks/**")
+               .filters(f -> f
+                       .rewritePath("/api/(?<path>.*)", "/api/${path}")
+                       .filter(authFilter.apply(
+                               configWithAuth(true, Arrays.asList("ROLE_USER", "ROLE_ADMIN", "ROLE_STAFF")))))
+               .uri("lb://movie-show-service"))
+```
+
+- **Path**: Khớp với nhiều đường dẫn khác nhau liên quan đến chức năng movie show
+- **Filters**: Yêu cầu xác thực với role "ROLE_USER", "ROLE_ADMIN", hoặc "ROLE_STAFF"
+
+### 5. Các endpoint Bill Service
+
+```java
+.route("bill-service", 
+       r -> r.path("/api/bills/**", "/api/payments/**")
+               // Cấu hình filter tương tự
+               .uri("lb://bill-service"))
+```
+
+### 6. Task Service (Booking Service)
+
+```java
+.route("task-service", 
+       r -> r.path("/api/booking/**")
+               .filters(f -> f
+                       .rewritePath("/api/(?<path>.*)", "/api/${path}")
+                       .filter(authFilter.apply(
+                               configWithAuth(true, Arrays.asList("ROLE_USER")))))
+               .uri("lb://task-service"))
+```
+
+- **Đặc biệt**: Chỉ cho phép người dùng có role "ROLE_USER" (không cho phép ADMIN hoặc STAFF) 
+
+### 7. Notification Service
+
+```java
+.route("notification-service", 
+       r -> r.path("/api/notifications/**")
+               // Cấu hình filter tương tự
+               .uri("lb://notification-service"))
+```
+
+## Tóm tắt
+
+Lớp `SpringCloudConfig` định nghĩa cách thức API Gateway:
+
+1. **Phân biệt giữa các endpoint công khai và bảo vệ:**
+   - Endpoints công khai: Không yêu cầu xác thực (login, register, validate-token)
+   - Endpoints bảo vệ: Yêu cầu xác thực và có thể yêu cầu role cụ thể
+
+2. **Áp dụng các policy bảo mật khác nhau:**
+   - Một số endpoint chỉ yêu cầu user đã đăng nhập
+   - Một số endpoint yêu cầu user có role cụ thể (USER, ADMIN, STAFF)
+   - Endpoint booking chỉ cho phép USER thông thường truy cập
+
+3. **Rewrite path và định tuyến:**
+   - Chuyển đổi đường dẫn từ gateway sang định dạng mà microservice mong đợi
+   - Sử dụng load balancer để định tuyến request đến các microservices
+
+4. **Logging và giám sát:**
+   - Ghi lại thông tin về request path và response status để debug và giám sát
+
+Đây là một thiết kế bảo mật tốt cho gateway, áp dụng mô hình "defense in depth" với nhiều lớp bảo vệ và kiểm soát truy cập chi tiết đến từng endpoint.
